@@ -3,12 +3,12 @@ package main
 import (
 	"bittorrent/src/decoder"
 	"bittorrent/src/protocol"
-	"bittorrent/src/types"
 	"bufio"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 )
@@ -52,35 +52,35 @@ func cmd_decode(bencode []byte) {
 
 }
 func cmd_info(path string) {
-	metaInfo, _ := types.MetaInfoFromFile(path)
+	metaInfo,_, e := decoder.MetaInfoFromFile(path)
+    if e!=nil{
+        log.Panicln(e)
+    }
 	print_info(metaInfo)
 }
 
 func cmd_peer(path string) {
-	metaInfo, _ := types.MetaInfoFromFile(path)
-    p,e:=protocol.GetPeers(metaInfo)
+	metaInfo,_, _ := decoder.MetaInfoFromFile(path)
+	p, e := protocol.GetPeers(metaInfo)
 	if e != nil {
-		fmt.Println("Error",e)
+		fmt.Println("Error", e)
 		os.Exit(1)
 	}
-    for _,peer := range p{
-        println(peer.String())
-    }
+	for _, peer := range p {
+		println(peer.String())
+	}
 }
 func cmd_handshake(path string, ip_str string) {
-	metaInfo, _ := types.MetaInfoFromFile(path)
-	hash, _ := protocol.CalculateInfoHash(metaInfo.Info)
-	hash_decoded, _ := hex.DecodeString(hash)
-
-	handshake := types.PeerHandshake{
+	_,hash, _ := decoder.MetaInfoFromFile(path)
+	handshake := protocol.PeerHandshake{
 		Protocol: "BitTorrent protocol",
-		InfoHash: string(hash_decoded),
+		InfoHash: string(hash),
 		PeerId:   "00112233445566778899",
 	}
 
 	con, error := protocol.CreateConnection(ip_str)
 	if error != nil {
-		println("Error creating connection: ", error)
+		fmt.Printf("Error creating connection: %v\n", error)
 		return
 	}
 	peerId, e := con.Handshake(handshake)
@@ -93,33 +93,30 @@ func cmd_handshake(path string, ip_str string) {
 func cmdDownloadPiece(path string, file string, index int) {
 
 	//obtain metainfo and hash
-	metaInfo, _ := types.MetaInfoFromFile(file)
-	hash, _ := protocol.CalculateInfoHash(metaInfo.Info)
-	hash_decoded, _ := hex.DecodeString(hash)
-
+	metaInfo,hash, _ := decoder.MetaInfoFromFile(file)
 	//get peers
 	peers, _ := protocol.GetPeers(metaInfo)
-    if len(peers) == 0{
-        println("No peers found")
-        os.Exit(1)
-    }
+	if len(peers) == 0 {
+		println("No peers found")
+		os.Exit(1)
+	}
 
 	//create connection
 	con, error := protocol.CreateConnection(peers[0].String())
-	println("Connecting to ", peers[0].String())
+	log.Printf("Connecting to %s\n", peers[0].String())
 	if error != nil {
-		println("Error creating connection: ", error)
+		fmt.Printf("Error creating connection: %v\n", error)
 		return
 	}
-	handshake := types.PeerHandshake{
+	handshake := protocol.PeerHandshake{
 		Protocol: "BitTorrent protocol",
-		InfoHash: string(hash_decoded),
+		InfoHash: string(hash),
 		PeerId:   "00112233445566778899",
 	}
 	peerId, _ := con.Handshake(handshake)
-	fmt.Printf("Handshake made, Peer id: %s\n", peerId)
+	log.Printf("Handshake made, Peer id: %s\n", peerId)
 
-	piece,_, e := con.DownloadPiece(index, metaInfo.Info)
+	piece, _, e := con.DownloadPiece(index, metaInfo.Info)
 
 	if e != nil {
 		fmt.Printf("Error downloading piece: %v\n", e)
@@ -130,83 +127,90 @@ func cmdDownloadPiece(path string, file string, index int) {
 
 	writer := bufio.NewWriter(newFile)
 
-		_, err := writer.Write(piece)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-	println("Piece", index, "downloaded to", path)
+	_, err := writer.Write(piece)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	log.Println("Piece", index, "downloaded to", path)
 
 }
 
 func cmdDownload(path string, file string) {
 
 	//obtain metainfo and hash
-	metaInfo, _ := types.MetaInfoFromFile(file)
-	hash, _ := protocol.CalculateInfoHash(metaInfo.Info)
-	hash_decoded, _ := hex.DecodeString(hash)
-
+	metaInfo, hash, _ := decoder.MetaInfoFromFile(file)
 	//get peers
 	peers, _ := protocol.GetPeers(metaInfo)
 
 	//create connection
-	con, error := protocol.CreateConnection(peers[0].String())
-	println("Connecting to ", peers[0].String())
-	if error != nil {
-		println("Error creating connection: ", error)
-		return
+	// TODO: check if peers work if more than 1
+	con, e := protocol.CreateConnection(peers[0].String())
+	log.Println("Connecting to", peers[0].String())
+	if e != nil {
+		log.Panicln(e)
 	}
-	handshake := types.PeerHandshake{
-		Protocol: "BitTorrent protocol",
-		InfoHash: string(hash_decoded),
-		PeerId:   "00112233445566778899",
-	}
+	handshake := protocol.NewHandshake(hash)
 	peerId, _ := con.Handshake(handshake)
-	fmt.Printf("Handshake made, Peer id: %s\n", peerId)
+	log.Printf("Handshake made, peer_id: %s.\n", peerId)
 
 	piecelist := pieces_hashes(metaInfo.Info.Pieces)
 
-    totalDownloaded:=0
-
-
-    
-	
-	con.WaitResponse() //wait for bitfield
-    _, e := con.Interested() //send interested msg
+	con.WaitResponse() // unchoke received or bitfield
+	_, e = con.SendInterested()         //send interested msg
 	if e != nil {
-        println("Error: ",e)
+		log.Panicln(e)
 	}
-    con.WaitResponse()
-    
- 
+	totalDownloaded := 0
+	piecesLeft := len(piecelist)
+
+	for piecesLeft > 0 {
+        fmt.Printf("\rDownloading pieces: %d/%d...",len(piecelist)-piecesLeft,len(piecelist))
+
+		msgType, content, _ := con.WaitResponse() //wait for Have to tell index
+		if msgType == protocol.HAVE {
+			indexAvailable := con.ManageResponse(msgType, content).(uint32)
+            //todo get piece data
+			_, _, e := con.DownloadPiece(int(indexAvailable), metaInfo.Info)
+			if e != nil {
+				log.Panicln(e)
+			}
+            piecesLeft--
+			//log.Println("Piece", indexAvailable, "downloaded. Pieces remaining", piecesLeft)
+			_, e = con.SendHave(indexAvailable) //send we have received the piece
+		}else{
+            //log.Println("NO have, type",msgType.String())
+        }
+
+	}
+    log.Println("All pieces received")
+
+	return
 
 	for i, p := range piecelist {
-        newFile, _ := os.OpenFile(path,os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		newFile, _ := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 
-		piece,size, e := con.DownloadPiece(i, metaInfo.Info)
-        totalDownloaded+=size
+		piece, size, e := con.DownloadPiece(i, metaInfo.Info)
+		totalDownloaded += size
 		if e != nil {
 			fmt.Printf("Error downloading piece: %v\n", e)
 			return
 		}
 
+		fmt.Printf("Piece %d downloaded: %d bytes. Remaining bytes: %d\n", i, len(piece), metaInfo.Info.Length-totalDownloaded)
+		sha := sha1.Sum(piece)
+		shaD := hex.EncodeToString(sha[:])
+		if p != shaD {
+			println("Error: downloaded piece", i, "hash is not the same as actual")
+			fmt.Printf("Expected:\n%s\nActual:\n%s\n", p, shaD)
+			return
+		}
 
-        fmt.Printf("Piece %d downloaded: %d bytes. Remaining bytes: %d\n",i,len(piece),metaInfo.Info.Length-totalDownloaded)
-        sha:=sha1.Sum(piece)
-        shaD:=hex.EncodeToString(sha[:])
-        if p != shaD{
-            println("Error: downloaded piece",i,"hash is not the same as actual")
-            fmt.Printf("Expected:\n%s\nActual:\n%s\n",p,shaD)
-            return
-        }
-
-        newFile.Write(piece)
-        newFile.Close()
+		newFile.Write(piece)
+		newFile.Close()
 	}
 
-
-
-	println("File", metaInfo.Info.Name, "downloaded to", path)
+	//println("File", metaInfo.Info.Name, "downloaded to", path)
 
 }
 
@@ -224,8 +228,8 @@ func pieces_hashes(pieces []byte) []string {
 	return list
 
 }
-func print_info(metaInfo types.MetaInfo) {
-	hash, _ := protocol.CalculateInfoHash(metaInfo.Info)
+func print_info(metaInfo decoder.MetaInfo) {
+	hash, _ := decoder.CalculateInfoHash(metaInfo.Info)
 	fmt.Printf("Tracker URL: %s\n", metaInfo.Announce)
 	fmt.Printf("Length: %d\n", metaInfo.Info.Length)
 	fmt.Printf("Info Hash: %s\n", hash)

@@ -1,7 +1,7 @@
 package protocol
 
 import (
-	"bittorrent/src/types"
+	"bittorrent/src/decoder"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,45 +10,7 @@ import (
 	"net"
 )
 
-type Type int8
 
-const (
-	CHOKE        Type = 0
-	UNCHOKE      Type = 1
-	INTERESTED   Type = 2
-	NOT_INTEREST Type = 3
-	HAVE         Type = 4
-	BITFIELD     Type = 5
-	REQUEST      Type = 6
-	PIECE        Type = 7
-	CANCEL       Type = 8
-)
-
-func (t Type) String() string {
-	switch t {
-	case CHOKE:
-		return "CHOKE"
-	case UNCHOKE:
-		return "UNCHOKE"
-	case INTERESTED:
-		return "INTERESTED"
-	case NOT_INTEREST:
-		return "NOT_INTERESTED"
-	case HAVE:
-		return "HAVE"
-	case BITFIELD:
-		return "BITFIELD"
-
-	case REQUEST:
-		return "REQUEST"
-	case PIECE:
-		return "PIECE"
-	case CANCEL:
-		return "CANCEL"
-	default:
-		return ""
-	}
-}
 
 type Connection struct {
 	con net.Conn
@@ -64,7 +26,7 @@ func CreateConnection(address string) (Connection, error) {
 		con: con,
 	}, nil
 }
-func (c *Connection) Interested() (int, error) {
+func (c *Connection) SendInterested() (int, error) {
 	content := []byte{}
 	content = append(content, []byte{0, 0, 0, 1}...)
 	content = append(content, byte(INTERESTED))
@@ -74,17 +36,30 @@ func (c *Connection) Interested() (int, error) {
 /* Sends a request message
 * @return number of bytes sent or error
  */
-func (c *Connection) Request(payload types.PeerRequest) (int, error) {
+func (c *Connection) SendRequest(payload PeerRequest) (int, error) {
 	msg := peerRequestToBytes(payload)
+	//log.Println("PROTOCOL: OUT-> Request")
 	return c.con.Write(msg)
+}
+
+func (c *Connection) SendHave(index uint32) (int, error) {
+	haveMsg := HaveMessage{
+		LengthPrefix: 5,
+		MsgType:      HAVE,
+		Index:        index,
+	}
+	//log.Println("PROTOCOL: OUT-> HAVE")
+	return c.con.Write(haveMsg.toBytes())
+
 }
 
 /* Makes the handshake to the connection with the peer message.
 * @returns a tuple with the peer id or the error
  */
-func (c *Connection) Handshake(handshake types.PeerHandshake) (string, error) {
+func (c *Connection)Handshake(handshake PeerHandshake) (string, error) {
 	msg := peerHandshakeToBytes(handshake)
 	_, e := c.con.Write(msg)
+	//log.Println("PROTOCOL: OUT-> Handshake")
 	if e != nil {
 		return "", e
 	}
@@ -96,12 +71,12 @@ func (c *Connection) Handshake(handshake types.PeerHandshake) (string, error) {
 
 	peerId := buffer[len(buffer)-20:]
 	hexadecimalPeerId := fmt.Sprintf("%x", peerId)
+	//log.Println("PROTOCOL: IN-> Handshake")
 
 	return hexadecimalPeerId, nil
 }
 
-func (c *Connection) DownloadPiece(index int, info types.Info) ([]byte,int, error) {
-
+func (c *Connection)DownloadPiece(index int, info decoder.Info) ([]byte, int, error) {
 
 	pieceSize := info.PieceLength
 	numPieces := int(math.Ceil(float64(info.Length) / float64(pieceSize)))
@@ -111,57 +86,76 @@ func (c *Connection) DownloadPiece(index int, info types.Info) ([]byte,int, erro
 
 	blockSize := 16 * 1024 //block size
 	numBlocks := int(math.Ceil(float64(pieceSize) / float64(blockSize)))
-    piece:=types.NewPiece(uint32(index),uint32(pieceSize))
-    for i := range numBlocks {
+	piece := NewPiece(uint32(index), uint32(pieceSize))
+	//log.Println("Downloading piece", index)
+    	for i := range numBlocks {
+        fmt.Print("+")
+
 		currentSize := blockSize
-		if i == numBlocks -1 { //if last block
+		if i == numBlocks-1 { //if last block
 			currentSize = int(pieceSize - blockSize*i) // because of the offset for begin
 		}
-        //send request
-        requestMsg := CreatePeerRequest(uint32(index),uint32(i * blockSize),uint32(currentSize))
+		//send request
+		requestMsg := CreatePeerRequest(uint32(index), uint32(i*blockSize), uint32(currentSize))
 		content := peerRequestToBytes(requestMsg)
 		c.con.Write(content)
-        response, e := c.WaitResponse()
+		//log.Printf("Request sent to peer: %+v\n", content)
+		msgType, response, e := c.WaitResponse()
 		if e != nil {
-			return []byte{},0, e
+			return []byte{}, 0, e
 		}
-		pieceResponse := types.BytesToPiece(response)
-        piece.AddBlock(pieceResponse.Block,i)
-
-
-
+		var pieceResponse PieceResponse
+		if msgType == PIECE {
+			pieceResponse = c.ManageResponse(msgType, response).(PieceResponse)
+		} else {
+			return []byte{}, 0, errors.New("Got another pacakge, not PIECE")
+		}
+		piece.AddBlock(pieceResponse.Block, i)
+		//log.Printf("Block %d downloaded.\n", i)
 	}
+        fmt.Print("\r\033[K")
     if !piece.IsComplete() {
-        return []byte{},pieceSize,errors.New("The piece is not complete")
-    }
-    pieceData:=piece.ConcatBlocks()
-    return pieceData,pieceSize,nil
+		return []byte{}, pieceSize, errors.New("The piece is not complete")
+	}
+	pieceData := piece.ConcatBlocks()
+	return pieceData, pieceSize, nil
 
 }
-func (c *Connection) WaitResponse() ([]byte, error) {
-    prefixBuffer:=make([]byte,4)
+func (c *Connection) WaitResponse() (Type, []byte, error) {
+	//log.Println("Waiting for peer response")
+	prefixBuffer := make([]byte, 4)
 	_, e := c.con.Read(prefixBuffer)
 	if e != nil {
-		return []byte{}, e
+		return 0, []byte{}, e
 	}
-    length:=binary.BigEndian.Uint32(prefixBuffer)
+	length := binary.BigEndian.Uint32(prefixBuffer)
 
-
+    if length == 0 {
+        return 9,nil,nil
+    }
 	buffer := make([]byte, length)
-	_, e = io.ReadFull(c.con,buffer)
+	_, e = io.ReadFull(c.con, buffer)
 	if e != nil {
-		return  []byte{}, e
+		return 0, []byte{}, e
 	}
-    
+	msgType := Type(buffer[0])
 
-    return buffer, nil
+    //log.Printf("PROTOCOL: IN->%s\n", msgType.String())
+
+	return msgType, buffer[1:], nil
 
 }
 
-type PeerMessage struct {
-	lengthPrefix uint32
-	id           uint8
-	index        uint32
-	begin        uint32
-	length       uint32
+func (c *Connection) ManageResponse(msgType Type, buffer []byte) any {
+	switch msgType {
+	case HAVE:
+		index := binary.BigEndian.Uint32(buffer)
+		return index
+	case PIECE:
+		return BytesToPiece(buffer)
+	default: //if default return buffer as it is
+		return buffer
+	}
 }
+
+
